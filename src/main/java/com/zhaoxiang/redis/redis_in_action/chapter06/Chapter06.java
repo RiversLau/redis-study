@@ -6,6 +6,10 @@ import redis.clients.jedis.Jedis;
 import redis.clients.jedis.Transaction;
 import redis.clients.jedis.Tuple;
 
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.Writer;
 import java.util.*;
 
 /**
@@ -14,21 +18,22 @@ import java.util.*;
  */
 public class Chapter06 {
 
-    public static void main(String[] args) throws InterruptedException {
+    public static void main(String[] args) throws InterruptedException, IOException {
 
         new Chapter06().run();
     }
 
-    public void run() throws InterruptedException {
+    public void run() throws InterruptedException, IOException {
 
         Jedis conn = new Jedis("119.23.26.77", 6379);
         conn.auth("zhaoxiang@85&35");
         conn.select(15);
 
-//        testAddUpdateContact(conn);
-//        testAddressBookAutoComplete(conn);
-//        testDelayedTasks(conn);
+        testAddUpdateContact(conn);
+        testAddressBookAutoComplete(conn);
+        testDelayedTasks(conn);
         testMultiRecipientMessaging(conn);
+        testFileDistribution(conn);
     }
 
     private void testAddUpdateContact(Jedis conn) {
@@ -141,6 +146,45 @@ public class Chapter06 {
             System.out.println("ChatId = " + cm.getChatId());
             System.out.println("Messages = " + cm.getMessages());
         }
+    }
+
+    public void testFileDistribution(Jedis conn) throws IOException {
+
+        String[] keys = conn.keys("test:*").toArray(new String[0]);
+        if (keys.length > 0){
+            conn.del(keys);
+        }
+        conn.del("msgs:test:", "seen:0", "seen:source", "ids:test:", "chat:test:");
+
+        File f1 = File.createTempFile("temp_redis_1", ".txt");
+        f1.deleteOnExit();
+
+        Writer writer = new FileWriter(f1);
+        writer.write("one line\n");
+        writer.close();
+
+        File f2 = File.createTempFile("temp_redis_2", ".txt");
+        f2.deleteOnExit();
+        writer = new FileWriter(f2);
+
+        for (int i = 0; i < 100; i++) {
+            writer.write("many lines " + i + "\n");
+        }
+        writer.close();
+
+        File f3 = File.createTempFile("temp_redis_3", ".txt.gz");
+        f3.deleteOnExit();
+        writer = new FileWriter(f3);
+        Random random = new Random();
+        for (int i = 0; i < 1000; i++) {
+            writer.write("random line " + Long.toHexString(random.nextLong()) + "\n");
+        }
+        writer.close();
+
+        long size = f3.length();
+        File path = f1.getParentFile();
+        CopyLogsThread thread = new CopyLogsThread(conn, path, "test:", 1, size);
+        thread.start();
     }
 
     public String createChat(Jedis conn, String sender, Set<String> recipients, String message) {
