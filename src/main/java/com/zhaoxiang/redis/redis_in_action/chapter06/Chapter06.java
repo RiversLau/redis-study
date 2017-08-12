@@ -2,15 +2,14 @@ package com.zhaoxiang.redis.redis_in_action.chapter06;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
+import com.zhaoxiang.redis.redis_in_action.chapter02.Callback;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.Transaction;
 import redis.clients.jedis.Tuple;
 
-import java.io.File;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.io.Writer;
+import java.io.*;
 import java.util.*;
+import java.util.zip.GZIPInputStream;
 
 /**
  * Author: Rivers
@@ -29,10 +28,10 @@ public class Chapter06 {
         conn.auth("zhaoxiang@85&35");
         conn.select(15);
 
-        testAddUpdateContact(conn);
-        testAddressBookAutoComplete(conn);
-        testDelayedTasks(conn);
-        testMultiRecipientMessaging(conn);
+//        testAddUpdateContact(conn);
+//        testAddressBookAutoComplete(conn);
+//        testDelayedTasks(conn);
+//        testMultiRecipientMessaging(conn);
         testFileDistribution(conn);
     }
 
@@ -148,7 +147,7 @@ public class Chapter06 {
         }
     }
 
-    public void testFileDistribution(Jedis conn) throws IOException {
+    public void testFileDistribution(Jedis conn) throws IOException, InterruptedException {
 
         String[] keys = conn.keys("test:*").toArray(new String[0]);
         if (keys.length > 0){
@@ -185,6 +184,100 @@ public class Chapter06 {
         File path = f1.getParentFile();
         CopyLogsThread thread = new CopyLogsThread(conn, path, "test:", 1, size);
         thread.start();
+
+        Thread.sleep(250);
+        TestCallback  callback = new TestCallback();
+        processLogsFromRedis(conn, "0", callback);
+        assert callback.counts.get(0) == 1;
+        assert callback.counts.get(1) == 100;
+        assert callback.counts.get(2) == 1000;
+
+        thread.join();
+
+        keys = conn.keys("test:*").toArray(new String[0]);
+        if (keys.length > 0) {
+            conn.del(keys);
+        }
+        conn.del("msgs:test:", "seen:0", "seen:source", "ids:test:", "chat:test:");
+    }
+
+    public void processLogsFromRedis(Jedis conn, String id, Callback callback) throws IOException, InterruptedException {
+
+        while (true) {
+            List<ChatMessage> fdata = fetchPendingMessage(conn, id);
+
+            for (ChatMessage msg : fdata) {
+                for (Map<String, Object> m : msg.getMessages()) {
+                    String logFile = (String) m.get("message");
+                    if (":done".equals(logFile)) {
+                        return;
+                    }
+                    if (logFile == null || logFile.length() == 0) {
+                        continue;
+                    }
+                    InputStream in = new RedisInputStream(conn, msg.getChatId() + logFile);
+                    if (logFile.endsWith(".gz")) {
+                        in = new GZIPInputStream(in);
+                    }
+
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(in));
+                    try {
+                        String line = null;
+                        while ((line = reader.readLine()) != null) {
+                            callback.callBack(line);
+                        }
+                        callback.callBack(null);
+                    } finally {
+                        reader.close();
+                    }
+
+                    conn.incr(msg.getChatId() + logFile + ":done");
+                }
+            }
+            if (fdata.size() == 0) {
+                Thread.sleep(100);
+            }
+        }
+    }
+
+    public class RedisInputStream extends InputStream {
+
+        private Jedis conn;
+        private String key;
+        private int pos;
+
+        public RedisInputStream(Jedis conn, String key) {
+            this.conn = conn;
+            this.key = key;
+        }
+
+        public int available() {
+            long len = conn.strlen(key);
+            return (int)(len - pos);
+        }
+
+        public int read() {
+            byte[] block = conn.substr(key.getBytes(), pos, pos);
+            if (block == null || block.length == 0) {
+                return -1;
+            }
+            pos++;
+            return block[0] & 0xff;
+        }
+
+        public int read(byte[] buf, int off, int len) {
+            byte[] block = conn.substr(key.getBytes(), pos, pos + (len - off - 1));
+            if (block == null || block.length == 0) {
+                return -1;
+            }
+            System.arraycopy(block, 0, buf, off, block.length);
+            pos += block.length;
+            return block.length;
+        }
+
+        public void close() {
+
+        }
     }
 
     public String createChat(Jedis conn, String sender, Set<String> recipients, String message) {
@@ -430,6 +523,139 @@ public class Chapter06 {
                     conn.rpush("queue:" + queue, id);
                 }
             }
+        }
+    }
+
+    /**
+     * Author: Rivers
+     * Date: 2017/8/12 16:48
+     */
+    public class CopyLogsThread extends Thread {
+
+        private Jedis conn;
+        private File path;
+        private String channel;
+        private int count;
+        private long limit;
+
+        public CopyLogsThread(Jedis conn, File path, String channel, int count, long limit) {
+            this.conn = conn;
+            this.path = path;
+            this.channel = channel;
+            this.count = count;
+            this.limit = limit;
+        }
+
+        public void run() {
+
+            Deque<File> waiting = new ArrayDeque<File>();
+            long bytesInRedis = 0;
+
+            Set<String> recipients = new HashSet<String>();
+            for (int i = 0; i < 10; i++) {
+                recipients.add(String.valueOf(i));
+            }
+
+            createChat(conn, "source", recipients, "", channel);
+            File[] logFiles = path.listFiles(new FilenameFilter() {
+                @Override
+                public boolean accept(File dir, String name) {
+                    return name.startsWith("temp_redis");
+                }
+            });
+
+            Arrays.sort(logFiles);
+
+            for (File logFile : logFiles) {
+                long fsize = logFile.length();
+                while ((bytesInRedis + fsize) > limit) {
+                    long cleaned = clean(waiting, count);
+                    if (cleaned != 0) {
+                        bytesInRedis -= cleaned;
+                    } else {
+                        try {
+                            sleep(250);
+                        } catch (InterruptedException e) {
+                            Thread.interrupted();
+                        }
+                    }
+                }
+
+                BufferedInputStream in = null;
+                try {
+                    in = new BufferedInputStream(new FileInputStream(logFile));
+                    int read = 0;
+                    byte[] buffer = new byte[8192];
+                    while ((read = in.read(buffer, 0, buffer.length)) != -1) {
+                        if (buffer.length != read) {
+                            byte[] bytes = new byte[read];
+                            System.arraycopy(buffer, 0, bytes, 0, read);
+                            conn.append((channel + logFile).getBytes(), bytes);
+                        } else {
+                            conn.append((channel + logFile).getBytes(), buffer);
+                        }
+                    }
+                } catch (FileNotFoundException e) {
+                    e.printStackTrace();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                } finally {
+                    try {
+                        in.close();
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                }
+
+                sendMessage(conn, channel, "source", logFile.toString());
+
+                bytesInRedis += fsize;
+                waiting.addLast(logFile);
+            }
+
+            sendMessage(conn, channel, "source", ":done");
+            while (waiting.size() > 0) {
+                long cleaned = clean(waiting, count);
+                if (cleaned != 0) {
+                    bytesInRedis -= cleaned;
+                } else {
+                    try {
+                        sleep(250);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        }
+
+        private long clean(Deque<File> waiting, int count) {
+            if (waiting.size() == 0) {
+                return 0;
+            }
+            File w0 = waiting.getFirst();
+            if (String.valueOf(count).equals(conn.get(channel + w0 + ":done"))) {
+                conn.del(channel + w0, channel + w0 + ":done");
+                return waiting.removeFirst().length();
+            }
+            return 0;
+        }
+    }
+
+    public class TestCallback implements Callback {
+
+        private int index;
+        public List<Integer> counts = new ArrayList<>();
+
+        @Override
+        public String callBack(String line) {
+            if (line == null) {
+                index++;
+            }
+            while (counts.size() == index) {
+                counts.add(0);
+            }
+            counts.set(index, counts.get(index) + 1);
+            return null;
         }
     }
 }
