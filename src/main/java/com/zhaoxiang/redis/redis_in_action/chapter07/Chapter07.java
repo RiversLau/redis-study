@@ -1,9 +1,7 @@
 package com.zhaoxiang.redis.redis_in_action.chapter07;
 
-import redis.clients.jedis.Jedis;
-import redis.clients.jedis.SortingParams;
-import redis.clients.jedis.Transaction;
-import redis.clients.jedis.ZParams;
+import org.javatuples.Pair;
+import redis.clients.jedis.*;
 
 import java.util.*;
 import java.util.regex.Matcher;
@@ -62,6 +60,9 @@ public class Chapter07 {
         conn.flushDB();
 
         testStringtoScore(conn);
+        testIndexAndTargetAds(conn);
+        testIsQualifiedForJob(conn);
+        testIndexAndFindJobs(conn);
     }
 
     public void testIndexDocument(Jedis conn) {
@@ -259,6 +260,69 @@ public class Chapter07 {
         zaddString(conn, "key", values);
         assert conn.zscore("key", "test") == stringToScore("value");
         assert conn.zscore("key", "test2") == stringToScore("other");
+    }
+
+    public void testIndexAndTargetAds(Jedis conn) {
+
+        indexAd(conn, "1", new String[]{"USA", "CA"}, CONTENT, Ecpm.CPC, .25);
+        indexAd(conn, "2", new String[]{"USA", "VA"}, CONTENT + " wooooo", Ecpm.CPC, .125);
+
+        String[] usa = new String[]{"USA"};
+        for (int i = 0; i < 100; i++) {
+            targetAds(conn, usa, CONTENT);
+        }
+        Pair<Long,String> result = targetAds(conn, usa, CONTENT);
+        long targetId = result.getValue0();
+        String adId = result.getValue1();
+        assert "1".equals(result.getValue1());
+
+        result = targetAds(conn, new String[]{"VA"}, "wooooo");
+        assert "2".equals(result.getValue1());
+
+        Iterator<Tuple> range = conn.zrangeWithScores("idx:ad:value:", 0, -1).iterator();
+        assert new Tuple("2", 0.125).equals(range.next());
+        assert new Tuple("1", 0.25).equals(range.next());
+
+        range = conn.zrangeWithScores("ad:base_value:", 0, -1).iterator();
+        assert new Tuple("2", 0.125).equals(range.next());
+        assert new Tuple("1", 0.25).equals(range.next());
+
+        recordClick(conn, targetId, adId, false);
+
+        range = conn.zrangeWithScores("idx:ad:value:", 0, -1).iterator();
+        assert new Tuple("2", 0.125).equals(range.next());
+        assert new Tuple("1", 2.5).equals(range.next());
+
+        range = conn.zrangeWithScores("ad:base_value:", 0, -1).iterator();
+        assert new Tuple("2", 0.125).equals(range.next());
+        assert new Tuple("1", 0.25).equals(range.next());
+    }
+
+    public void testIsQualifiedForJob(Jedis conn) {
+        System.out.println("\n----- testIsQualifiedForJob -----");
+        addJob(conn, "test", "q1", "q2", "q3");
+        assert isQualified(conn, "test", "q1", "q3", "q2");
+        assert !isQualified(conn, "test", "q1", "q2");
+    }
+
+    public void testIndexAndFindJobs(Jedis conn) {
+        System.out.println("\n----- testIndexAndFindJobs -----");
+        indexJob(conn, "test1", "q1", "q2", "q3");
+        indexJob(conn, "test2", "q1", "q3", "q4");
+        indexJob(conn, "test3", "q1", "q3", "q5");
+
+        assert findJobs(conn, "q1").size() == 0;
+
+        Iterator<String> result = findJobs(conn, "q1", "q3", "q4").iterator();
+        assert "test2".equals(result.next());
+
+        result = findJobs(conn, "q1", "q3", "q5").iterator();
+        assert "test3".equals(result.next());
+
+        result = findJobs(conn, "q1", "q2", "q3", "q4", "q5").iterator();
+        assert "test1".equals(result.next());
+        assert "test2".equals(result.next());
+        assert "test3".equals(result.next());
     }
 
     public Set<String> tokenize(String content) {
@@ -530,6 +594,294 @@ public class Chapter07 {
         return conn.zadd(name, pieces);
     }
 
+    private Map<Ecpm,Double> AVERAGE_PER_1K = new HashMap<Ecpm,Double>();
+    public void indexAd(Jedis conn, String id, String[] locations, String content, Ecpm type, double value) {
+
+        Transaction trans = conn.multi();
+
+        for (String location : locations) {
+            trans.sadd("idx:req:" + location, id);
+        }
+
+        Set<String> words = tokenize(content);
+        for (String word : tokenize(content)) {
+            trans.zadd("idx:" + word, 0, id);
+        }
+
+
+        double avg = AVERAGE_PER_1K.containsKey(type) ? AVERAGE_PER_1K.get(type) : 1;
+        double rvalue = toEcpm(type, 1000, avg, value);
+
+        trans.hset("type:", id, type.name().toLowerCase());
+        trans.zadd("idx:ad:value:", rvalue, id);
+        trans.zadd("ad:base_value:", value, id);
+        for (String word : words){
+            trans.sadd("terms:" + id, word);
+        }
+        trans.exec();
+    }
+
+    public double toEcpm(Ecpm type, double views, double avg, double value) {
+
+        switch (type) {
+            case CPC:
+            case CPA:
+                return 1000. * value * avg / views;
+            case CPM:
+                return value;
+        }
+        return value;
+    }
+
+    public Pair<Long, String> targetAds(Jedis conn, String[] locations, String content) {
+
+        Transaction trans = conn.multi();
+
+        String matchedAds = matchLocation(trans, locations);
+        String baseEcpm = zintersect(trans, 30, new ZParams().weightsByDouble(0, 1), matchedAds, "ad:value:");
+        Pair<Set<String>,String> result = finishScoring(trans, matchedAds, baseEcpm, content);
+        trans.incr("ads:served:");
+        trans.zrevrange("idx:" + result.getValue1(), 0, 0);
+
+        List<Object> response = trans.exec();
+        long targetId = (Long)response.get(response.size() - 2);
+        Set<String> targetedAds = (Set<String>)response.get(response.size() - 1);
+
+        if (targetedAds.size() == 0){
+            return new Pair<Long,String>(null, null);
+        }
+
+        String adId = targetedAds.iterator().next();
+        recordTargetingResult(conn, targetId, adId, result.getValue0());
+
+        return new Pair<Long,String>(targetId, adId);
+    }
+
+    public String matchLocation(Transaction trans, String[] locations) {
+
+        String[] required = new String[locations.length];
+        for (int i = 0; i < locations.length; i++) {
+            required[i] = "req:" + locations[i];
+        }
+        return union(trans, 300, required);
+    }
+
+    public Pair<Set<String>, String> finishScoring(Transaction trans, String matched, String base, String content) {
+
+        Map<String, Integer> bonusEcpm = new HashMap<>();
+        Set<String> words = tokenize(content);
+        for (String word : words) {
+            String wordBonus = zintersect(trans, 30, new ZParams().weightsByDouble(0, 1), matched, word);
+            bonusEcpm.put(wordBonus, 1);
+        }
+
+        if (bonusEcpm.size() > 0) {
+            String[] keys = new String[bonusEcpm.size()];
+            double[] weights = new double[bonusEcpm.size()];
+            int index = 0;
+            for (Map.Entry<String, Integer> bonus : bonusEcpm.entrySet()) {
+                keys[index] = bonus.getKey();
+                weights[index] = bonus.getValue();
+                index++;
+            }
+
+            ZParams minParams = new ZParams().aggregate(ZParams.Aggregate.MIN).weightsByDouble(weights);
+            String minimum = zunion(trans, 30, minParams, keys);
+
+            ZParams maxParams = new ZParams().aggregate(ZParams.Aggregate.MAX).weightsByDouble(weights);
+            String maximum = zunion(trans, 30, maxParams, keys);
+
+            String result = zunion(
+                    trans, 30, new ZParams().weightsByDouble(2, 1, 1), base, minimum, maximum);
+            return new Pair<>(words, result);
+        }
+        return new Pair<>(words, base);
+    }
+
+    public void recordTargetingResult(
+            Jedis conn, long targetId, String adId, Set<String> words)
+    {
+        Set<String> terms = conn.smembers("terms:" + adId);
+        String type = conn.hget("type:", adId);
+
+        Transaction trans = conn.multi();
+        terms.addAll(words);
+        if (terms.size() > 0) {
+            String matchedKey = "terms:matched:" + targetId;
+            for (String term : terms) {
+                trans.sadd(matchedKey, term);
+            }
+            trans.expire(matchedKey, 900);
+        }
+
+        trans.incr("type:" + type + ":views:");
+        for (String term : terms) {
+            trans.zincrby("views:" + adId, 1, term);
+        }
+        trans.zincrby("views:" + adId, 1, "");
+
+        List<Object> response = trans.exec();
+        double views = (Double)response.get(response.size() - 1);
+        if ((views % 100) == 0){
+            updateCpms(conn, adId);
+        }
+    }
+
+    public void updateCpms(Jedis conn, String adId) {
+        Transaction trans = conn.multi();
+        trans.hget("type:", adId);
+        trans.zscore("ad:base_value:", adId);
+        trans.smembers("terms:" + adId);
+        List<Object> response = trans.exec();
+        String type = (String)response.get(0);
+        Double baseValue = (Double)response.get(1);
+        Set<String> words = (Set<String>)response.get(2);
+
+        String which = "clicks";
+        Ecpm ecpm = Enum.valueOf(Ecpm.class, type.toUpperCase());
+        if (Ecpm.CPA.equals(ecpm)) {
+            which = "actions";
+        }
+
+        trans = conn.multi();
+        trans.get("type:" + type + ":views:");
+        trans.get("type:" + type + ':' + which);
+        response = trans.exec();
+        String typeViews = (String)response.get(0);
+        String typeClicks = (String)response.get(1);
+
+        AVERAGE_PER_1K.put(ecpm,
+                1000. *
+                        Integer.valueOf(typeClicks != null ? typeClicks : "1") /
+                        Integer.valueOf(typeViews != null ? typeViews : "1"));
+
+        if (Ecpm.CPM.equals(ecpm)) {
+            return;
+        }
+
+        String viewKey = "views:" + adId;
+        String clickKey = which + ':' + adId;
+
+        trans = conn.multi();
+        trans.zscore(viewKey, "");
+        trans.zscore(clickKey, "");
+        response = trans.exec();
+        Double adViews = (Double)response.get(0);
+        Double adClicks = (Double)response.get(1);
+
+        double adEcpm = 0;
+        if (adClicks == null || adClicks < 1){
+            Double score = conn.zscore("idx:ad:value:", adId);
+            adEcpm = score != null ? score.doubleValue() : 0;
+        }else{
+            adEcpm = toEcpm(
+                    ecpm,
+                    adViews != null ? adViews.doubleValue() : 1,
+                    adClicks != null ? adClicks.doubleValue() : 0,
+                    baseValue);
+            conn.zadd("idx:ad:value:", adEcpm, adId);
+        }
+        for (String word : words) {
+            trans = conn.multi();
+            trans.zscore(viewKey, word);
+            trans.zscore(clickKey, word);
+            response = trans.exec();
+            Double views = (Double)response.get(0);
+            Double clicks = (Double)response.get(1);
+
+            if (clicks == null || clicks < 1){
+                continue;
+            }
+
+            double wordEcpm = toEcpm(
+                    ecpm,
+                    views != null ? views.doubleValue() : 1,
+                    clicks != null ? clicks.doubleValue() : 0,
+                    baseValue);
+            double bonus = wordEcpm - adEcpm;
+            conn.zadd("idx:" + word, bonus, adId);
+        }
+    }
+
+    public void recordClick(Jedis conn, long targetId, String adId, boolean action) {
+        String type = conn.hget("type:", adId);
+        Ecpm ecpm = Enum.valueOf(Ecpm.class, type.toUpperCase());
+
+        String clickKey = "clicks:" + adId;
+        String matchKey = "terms:matched:" + targetId;
+        Set<String> matched = conn.smembers(matchKey);
+        matched.add("");
+
+        Transaction trans = conn.multi();
+        if (Ecpm.CPA.equals(ecpm)) {
+            trans.expire(matchKey, 900);
+            if (action) {
+                clickKey = "actions:" + adId;
+            }
+        }
+
+        if (action && Ecpm.CPA.equals(ecpm)) {
+            trans.incr("type:" + type + ":actions:");
+        }else{
+            trans.incr("type:" + type + ":clicks:");
+        }
+
+        for (String word : matched) {
+            trans.zincrby(clickKey, 1, word);
+        }
+        trans.exec();
+
+        updateCpms(conn, adId);
+    }
+
+    public void addJob(Jedis conn, String jobId, String... requiredSkills) {
+        conn.sadd("job:" + jobId, requiredSkills);
+    }
+
+    @SuppressWarnings("unchecked")
+    public boolean isQualified(Jedis conn, String jobId, String... candidateSkills) {
+        String temp = UUID.randomUUID().toString();
+        Transaction trans = conn.multi();
+        for(String skill : candidateSkills) {
+            trans.sadd(temp, skill);
+        }
+        trans.expire(temp, 5);
+        trans.sdiff("job:" + jobId, temp);
+
+        List<Object> response = trans.exec();
+        Set<String> diff = (Set<String>)response.get(response.size() - 1);
+        return diff.size() == 0;
+    }
+
+    public void indexJob(Jedis conn, String jobId, String... skills) {
+        Transaction trans = conn.multi();
+        Set<String> unique = new HashSet<String>();
+        for (String skill : skills) {
+            trans.sadd("idx:skill:" + skill, jobId);
+            unique.add(skill);
+        }
+        trans.zadd("idx:jobs:req", unique.size(), jobId);
+        trans.exec();
+    }
+
+    public Set<String> findJobs(Jedis conn, String... candidateSkills) {
+        String[] keys = new String[candidateSkills.length];
+        int[] weights = new int[candidateSkills.length];
+        for (int i = 0; i < candidateSkills.length; i++) {
+            keys[i] = "skill:" + candidateSkills[i];
+            weights[i] = 1;
+        }
+
+        Transaction trans = conn.multi();
+        String jobScores = zunion(
+                trans, 30, new ZParams().weights(weights), keys);
+        String finalResult = zintersect(
+                trans, 30, new ZParams().weights(-1, 1), jobScores, "jobs:req");
+        trans.exec();
+
+        return conn.zrangeByScore("idx:" + finalResult, 0, 0);
+    }
+
     public class Query {
 
         public final List<List<String>> all = new ArrayList<>();
@@ -580,5 +932,9 @@ public class Chapter07 {
         public String toString(){
             return word + '=' + score;
         }
+    }
+
+    public enum Ecpm {
+        CPC, CPA, CPM
     }
 }
