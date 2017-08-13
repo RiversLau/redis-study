@@ -28,10 +28,10 @@ public class Chapter06 {
         conn.auth("zhaoxiang@85&35");
         conn.select(15);
 
-//        testAddUpdateContact(conn);
-//        testAddressBookAutoComplete(conn);
-//        testDelayedTasks(conn);
-//        testMultiRecipientMessaging(conn);
+        testAddUpdateContact(conn);
+        testAddressBookAutoComplete(conn);
+        testDelayedTasks(conn);
+        testMultiRecipientMessaging(conn);
         testFileDistribution(conn);
     }
 
