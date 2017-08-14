@@ -1,6 +1,7 @@
 package com.zhaoxiang.redis.redis_in_action.chapter08;
 
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.Transaction;
 import redis.clients.jedis.Tuple;
 
@@ -37,6 +38,8 @@ public class Chapter08 {
 
         testSyndicateStatus(conn);
         conn.flushDB();
+
+        testRefillTimeline(conn);
     }
 
     public void testCreateUserAndStatus(Jedis conn) {
@@ -100,6 +103,42 @@ public class Chapter08 {
 
         assert unfollowUser(conn, 1, 2);
         assert getStatusMessages(conn, 1).size() == 0;
+    }
+
+    public void testRefillTimeline(Jedis conn) throws InterruptedException {
+
+        assert createUser(conn, "TestUser", "Test User") == 1;
+        assert createUser(conn, "TestUser2", "Test User2") == 2;
+        assert createUser(conn, "TestUser3", "Test User3") == 3;
+
+        assert followUser(conn, 1, 2);
+        assert followUser(conn, 1, 3);
+
+        HOME_TIMELINE_SIZE = 5;
+
+        for (int i = 0; i < 10; i++) {
+            assert postStatus(conn, 2, "message") != -1;
+            assert postStatus(conn, 3, "message") != -1;
+            Thread.sleep(50);
+        }
+
+        assert getStatusMessages(conn, 1).size() == 5;
+        assert unfollowUser(conn, 1, 2);
+        assert getStatusMessages(conn, 1).size() < 5;
+
+        refillTimeline(conn, "following:1", "home:1");
+        List<Map<String,String>> messages = getStatusMessages(conn, 1);
+        assert messages.size() == 5;
+        for (Map<String,String> message : messages) {
+            assert "3".equals(message.get("uid"));
+        }
+
+        long statusId = Long.valueOf(messages.get(messages.size() -1).get("id"));
+        assert deleteStatus(conn, 3, statusId);
+        assert getStatusMessages(conn, 1).size() == 4;
+        assert conn.zcard("home:1") == 5;
+        cleanTimelines(conn, 3, statusId);
+        assert conn.zcard("home:1") == 4;
     }
 
     public long createUser(Jedis conn, String login, String name) {
@@ -255,6 +294,32 @@ public class Chapter08 {
         return posted;
     }
 
+    public boolean deleteStatus(Jedis conn, long uid, long statusId) {
+
+        String key = "status:" + statusId;
+        String lock = acquireLockWithTimeout(conn, key, 1, 10);
+        if (lock == null) {
+            return false;
+        }
+
+        try{
+            if (!String.valueOf(uid).equals(conn.hget(key, "uid"))) {
+                return false;
+            }
+
+            Transaction trans = conn.multi();
+            trans.del(key);
+            trans.zrem("profile:" + uid, String.valueOf(statusId));
+            trans.zrem("home:" + uid, String.valueOf(statusId));
+            trans.hincrBy("user:" + uid, "posts", -1);
+            trans.exec();
+
+            return true;
+        }finally{
+            releaseLock(conn, key, lock);
+        }
+    }
+
     public void syndicateStatus(Jedis conn, long uid, long statusId, long postTime, double start) {
 
         Set<Tuple> followers = conn.zrangeByScoreWithScores("followers:" + uid, String.valueOf(start), "inf", 0, POSTS_PER_PASS);
@@ -303,6 +368,96 @@ public class Chapter08 {
             }
         }
         return statuses;
+    }
+
+    public void refillTimeline(Jedis conn, String incoming, String timeline) {
+
+        refillTimeline(conn, incoming, timeline, 0);
+    }
+
+    public void refillTimeline(Jedis conn, String incoming, String timeline, double start) {
+
+        if (start == 0 && conn.zcard(timeline) >= 750) {
+            return;
+        }
+
+        Set<Tuple> users = conn.zrangeByScoreWithScores(
+                incoming, String.valueOf(start), "inf", 0, REFILL_USERS_STEP);
+
+        Pipeline pipeline = conn.pipelined();
+        for (Tuple tuple : users){
+            String uid = tuple.getElement();
+            start = tuple.getScore();
+            pipeline.zrevrangeWithScores("profile:" + uid, 0, HOME_TIMELINE_SIZE - 1);
+        }
+
+        List<Object> response = pipeline.syncAndReturnAll();
+        List<Tuple> messages = new ArrayList<Tuple>();
+        for (Object results : response) {
+            messages.addAll((Set<Tuple>)results);
+        }
+
+        Collections.sort(messages);
+        messages = messages.subList(0, HOME_TIMELINE_SIZE);
+
+        Transaction trans = conn.multi();
+        if (messages.size() > 0) {
+            for (Tuple tuple : messages) {
+                trans.zadd(timeline, tuple.getScore(), tuple.getElement());
+            }
+        }
+        trans.zremrangeByRank(timeline, 0, 0 - HOME_TIMELINE_SIZE - 1);
+        trans.exec();
+
+        if (users.size() >= REFILL_USERS_STEP) {
+            try{
+                Method method = getClass().getDeclaredMethod(
+                        "refillTimeline", Jedis.class, String.class, String.class, Double.TYPE);
+                executeLater("default", method, incoming, timeline, start);
+            }catch(Exception e){
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    public void cleanTimelines(Jedis conn, long uid, long statusId) {
+        cleanTimelines(conn, uid, statusId, 0, false);
+    }
+    public void cleanTimelines(
+            Jedis conn, long uid, long statusId, double start, boolean onLists)
+    {
+        String key = "followers:" + uid;
+        String base = "home:";
+        if (onLists) {
+            key = "list:out:" + uid;
+            base = "list:statuses:";
+        }
+        Set<Tuple> followers = conn.zrangeByScoreWithScores(
+                key, String.valueOf(start), "inf", 0, POSTS_PER_PASS);
+
+        Transaction trans = conn.multi();
+        for (Tuple tuple : followers) {
+            start = tuple.getScore();
+            String follower = tuple.getElement();
+            trans.zrem(base + follower, String.valueOf(statusId));
+        }
+        trans.exec();
+
+        Method method = null;
+        try{
+            method = getClass().getDeclaredMethod(
+                    "cleanTimelines", Jedis.class,
+                    Long.TYPE, Long.TYPE, Double.TYPE, Boolean.TYPE);
+        }catch(Exception e){
+            throw new RuntimeException(e);
+        }
+
+        if (followers.size() >= POSTS_PER_PASS) {
+            executeLater("default", method, uid, statusId, start, onLists);
+
+        }else if (!onLists) {
+            executeLater("default", method, uid, statusId, 0, true);
+        }
     }
 
     public String acquireLockWithTimeout(Jedis conn, String lockName, int acquireTimeout, int lockTimeout) {
